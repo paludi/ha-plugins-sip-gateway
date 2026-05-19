@@ -1,0 +1,191 @@
+name: Build and Publish ha-sip Docker Image
+
+# Triggered in three ways (see docs/upstream-build.md for details):
+#   1. Daily at 06:00 UTC  – polls for upstream changes; builds only when the
+#      upstream master SHA differs from the last-published SHA.
+#   2. Weekly on Sundays at 02:00 UTC – explicit weekly check.
+#   3. workflow_dispatch – manual trigger with an optional force-build flag.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # Daily at 06:00 UTC
+    - cron: '0 2 * * 0'   # Weekly on Sunday at 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if upstream has not changed'
+        required: false
+        type: boolean
+        default: false
+
+# Queue concurrent runs; never cancel an in-progress build so that a running
+# publish is never interrupted mid-push.
+concurrency:
+  group: build-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # needed to commit the updated build-state.json back
+  packages: write   # needed to push the image to GHCR
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Check out THIS repository so we can read the state file ────────
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 2. Fetch the latest commit SHA on arnonym/ha-plugins master ────────
+      - name: Fetch upstream latest commit SHA
+        id: upstream
+        run: |
+          SHA=$(curl -fsSL \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/arnonym/ha-plugins/commits/master" \
+            | jq -r '.sha')
+
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "::error::Failed to fetch upstream SHA – aborting."
+            exit 1
+          fi
+
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Upstream latest SHA: $SHA"
+
+      # ── 3. Read the persisted build state ─────────────────────────────────
+      - name: Read build state
+        id: state
+        run: |
+          STATE_FILE=".github/build-state.json"
+
+          if [ -f "$STATE_FILE" ]; then
+            LAST_SHA=$(jq -r '.last_built_sha // ""' "$STATE_FILE")
+            VERSION=$(jq -r '.version   // "1.0.0"' "$STATE_FILE")
+          else
+            LAST_SHA=""
+            VERSION="1.0.0"
+          fi
+
+          echo "last_sha=$LAST_SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"   >> "$GITHUB_OUTPUT"
+          echo "Last built SHA : $LAST_SHA"
+          echo "Current version: $VERSION"
+
+      # ── 4. Decide whether a new build is required ─────────────────────────
+      - name: Determine if build is needed
+        id: decision
+        run: |
+          UPSTREAM_SHA="${{ steps.upstream.outputs.sha }}"
+          LAST_SHA="${{ steps.state.outputs.last_sha }}"
+          FORCE="${{ inputs.force_build }}"
+
+          if [ "$FORCE" = "true" ] || [ -z "$LAST_SHA" ] || [ "$UPSTREAM_SHA" != "$LAST_SHA" ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "Build needed."
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "No build needed: upstream SHA unchanged ($UPSTREAM_SHA)."
+          fi
+
+      # ── 5. Compute the next semantic version ──────────────────────────────
+      # Increments the patch component.  Starting state is 1.0.0, so the very
+      # first real publish produces image version 1.0.1.
+      - name: Compute next version
+        if: steps.decision.outputs.needed == 'true'
+        id: version
+        run: |
+          CURRENT="${{ steps.state.outputs.version }}"
+          MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+          MINOR=$(echo "$CURRENT" | cut -d. -f2)
+          PATCH=$(echo "$CURRENT" | cut -d. -f3)
+          NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Next version: $NEXT  (bumped from $CURRENT)"
+
+      # ── 6. Check out the upstream source ──────────────────────────────────
+      - name: Checkout upstream repository (arnonym/ha-plugins)
+        if: steps.decision.outputs.needed == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: arnonym/ha-plugins
+          ref: master
+          path: upstream
+
+      # ── 7. Build the Docker image locally (no push yet) ───────────────────
+      # We build first so that the unit tests can be executed inside the fully
+      # assembled container (which includes the compiled pjsip/pjsua2 library
+      # that some tests depend on).
+      - name: Set up Docker Buildx
+        if: steps.decision.outputs.needed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: steps.decision.outputs.needed == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image locally for testing
+        if: steps.decision.outputs.needed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream/ha-sip
+          dockerfile: upstream/ha-sip/Dockerfile
+          build-args: BUILD_FROM=debian:bookworm
+          push: false
+          load: true
+          tags: ha-sip-test:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── 8. Run the upstream unit tests inside the built image ─────────────
+      # The container already has pjsip installed, so all tests – including
+      # those that import pjsua2 – can run successfully.
+      - name: Run upstream unit tests in Docker
+        if: steps.decision.outputs.needed == 'true'
+        run: |
+          docker run --rm \
+            ha-sip-test:latest \
+            python3 -m unittest discover -s /ha-sip -v
+
+      # ── 9. Tag and push the passing image to GHCR ─────────────────────────
+      - name: Tag and push image to GHCR
+        if: steps.decision.outputs.needed == 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.next }}"
+          # GHCR requires a lower-case owner
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/ha-sip"
+
+          docker tag ha-sip-test:latest "${IMAGE}:${VERSION}"
+          docker tag ha-sip-test:latest "${IMAGE}:latest"
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:latest"
+
+          echo "Published ${IMAGE}:${VERSION} and ${IMAGE}:latest"
+
+      # ── 10. Persist the new build state ───────────────────────────────────
+      - name: Update build state file
+        if: steps.decision.outputs.needed == 'true'
+        run: |
+          jq -n \
+            --arg sha     "${{ steps.upstream.outputs.sha }}" \
+            --arg version "${{ steps.version.outputs.next }}" \
+            --arg date    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{ last_built_sha: $sha, version: $version, last_build_date: $date }' \
+            > .github/build-state.json
+
+      - name: Commit and push updated state
+        if: steps.decision.outputs.needed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/build-state.json
+          git commit -m "ci: publish v${{ steps.version.outputs.next }} [upstream: ${{ steps.upstream.outputs.sha }}]"
+          git push
