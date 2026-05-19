@@ -11,7 +11,7 @@ builds the `ha-sip` Docker image from it, and publishes the result to the
 owner's private GitHub Container Registry (GHCR) namespace.
 
 ```
-arnonym/ha-plugins (master)
+arnonym/ha-plugins (default branch)
         │
         │  poll for new commits
         ▼
@@ -37,9 +37,9 @@ arnonym/ha-plugins (master)
 
 Because GitHub Actions cannot subscribe to push events in another user's
 repository, the "trigger on upstream commit" requirement is satisfied by the
-daily polling schedule. The workflow compares the latest upstream `master` SHA
-with the SHA stored in `.github/build-state.json`; a build is only executed
-when they differ (or when forced).
+daily polling schedule. The workflow resolves the current upstream default
+branch at runtime, compares its latest SHA with the SHA stored in
+`.github/build-state.json`, and only builds when they differ (or when forced).
 
 ---
 
@@ -48,13 +48,13 @@ when they differ (or when forced).
 ```
 ┌─────────────────────────────────────────────────┐
 │ 1. Checkout paludi/ha-plugins-sip-gateway        │
-│ 2. Fetch latest SHA from arnonym/ha-plugins API  │
+│ 2. Resolve upstream HEAD branch + latest SHA     │
 │ 3. Compare with .github/build-state.json         │
 │                                                  │
 │    SHA unchanged?  ──► skip (exit 0)             │
 │    SHA changed?    ──► continue                  │
 │                                                  │
-│ 4. Checkout arnonym/ha-plugins @ master          │
+│ 4. Checkout arnonym/ha-plugins @ default branch  │
 │ 5. docker build (local, no push)                 │
 │ 6. Run unit tests inside built container         │
 │                                                  │
@@ -147,7 +147,7 @@ To rebuild and republish even if the upstream SHA has not changed:
 | Item | Value |
 |------|-------|
 | Upstream repo | `arnonym/ha-plugins` |
-| Branch | `master` |
+| Branch | Upstream default branch (resolved at runtime) |
 | Docker context | `./ha-sip` |
 | Dockerfile | `ha-sip/Dockerfile` |
 | Build arg | `BUILD_FROM=debian:bookworm` |
