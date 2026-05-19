@@ -2,7 +2,7 @@ name: Build and Publish ha-sip Docker Image
 
 # Triggered in three ways (see docs/upstream-build.md for details):
 #   1. Daily at 06:00 UTC  – polls for upstream changes; builds only when the
-#      upstream master SHA differs from the last-published SHA.
+#      upstream default-branch SHA differs from the last-published SHA.
 #   2. Weekly on Sundays at 02:00 UTC – explicit weekly check.
 #   3. workflow_dispatch – manual trigger with an optional force-build flag.
 
@@ -39,21 +39,28 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 2. Fetch the latest commit SHA on arnonym/ha-plugins master ────────
-      - name: Fetch upstream latest commit SHA
+      # ── 2. Resolve the current upstream default branch and latest SHA ───────
+      - name: Fetch upstream default branch and latest commit SHA
         id: upstream
         run: |
-          SHA=$(curl -fsSL \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/arnonym/ha-plugins/commits/master" \
-            | jq -r '.sha')
+          UPSTREAM_URL="https://github.com/arnonym/ha-plugins.git"
+          BRANCH=$(git ls-remote --symref "$UPSTREAM_URL" HEAD | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2}')
 
-          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
-            echo "::error::Failed to fetch upstream SHA – aborting."
+          if [ -z "$BRANCH" ]; then
+            echo "::error::Failed to detect the upstream default branch – aborting."
             exit 1
           fi
 
+          SHA=$(git ls-remote "$UPSTREAM_URL" "refs/heads/$BRANCH" | awk 'NR==1 {print $1}')
+
+          if [ -z "$SHA" ]; then
+            echo "::error::Failed to fetch upstream SHA for branch '$BRANCH' – aborting."
+            exit 1
+          fi
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Upstream default branch: $BRANCH"
           echo "Upstream latest SHA: $SHA"
 
       # ── 3. Read the persisted build state ─────────────────────────────────
@@ -112,7 +119,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: arnonym/ha-plugins
-          ref: master
+          ref: ${{ steps.upstream.outputs.branch }}
           path: upstream
 
       # ── 7. Build the Docker image locally (no push yet) ───────────────────
